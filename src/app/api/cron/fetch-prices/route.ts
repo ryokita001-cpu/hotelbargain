@@ -13,7 +13,7 @@ function hasRoomInfo(entry: RakutenHotelEntry): entry is { roomInfo: RakutenRoom
   return "roomInfo" in entry;
 }
 
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const LOOKAHEAD_DAYS = 14; // 「直前1〜2週間がメイン」の要件に合わせる
 const HOTEL_NO_BATCH_SIZE = 15; // VacantHotelSearch は hotelNo を最大15件まで一度に指定できる
