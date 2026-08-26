@@ -1,0 +1,31 @@
+name: hotel-bargain cron
+
+# VercelのHobbyプランはCron Jobsが「1日1回まで」に制限されているため、
+# 3時間おきの価格取得・Deal判定はGitHub Actionsから叩く。
+# 事前に以下を設定しておくこと:
+#   - リポジトリの Variables: APP_BASE_URL（例: https://hotel-bargain.com）
+#   - リポジトリの Secrets:   CRON_SECRET（Vercel側の環境変数と同じ値）
+on:
+  schedule:
+    - cron: "0 */3 * * *" # fetch-prices
+    - cron: "30 */3 * * *" # detect-deals
+  workflow_dispatch: {} # 手動実行用
+
+jobs:
+  fetch-prices:
+    if: github.event.schedule == '0 */3 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call fetch-prices
+        run: |
+          curl -sf -X GET "${{ vars.APP_BASE_URL }}/api/cron/fetch-prices" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+
+  detect-deals:
+    if: github.event.schedule == '30 */3 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call detect-deals
+        run: |
+          curl -sf -X GET "${{ vars.APP_BASE_URL }}/api/cron/detect-deals" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
