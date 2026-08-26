@@ -29,8 +29,9 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 - 楽天Web ServiceのAPI仕様をドキュメントに頼らず実機検証し、`hotel-bargain-php/lib/RakutenClient.php`
   に反映（詳細は3章）
 - 2つの楽天アプリ(app1/app2)を交互利用してAPI呼び出し元を分散する仕組みを実装
-- レビュー数によるホテルの事前スクリーニング(`cron/discover_hotels.php`)を実装
-  → ただし現状フィルタが効いていない既知の不具合あり(4章参照)
+- レビュー数によるホテルの事前スクリーニング(`cron/discover_hotels.php`)を実装。
+  当初`fetch_prices.php`/`detect_deals.php`が選外ホテルにもAPI/計算コストを使い
+  続ける不具合があったが、`hotels.last_selected_at`で絞り込む形に修正済み(3章参照)
 - Gemini 2.5 Flash(無料枠)で「安さの推定理由」を生成する仕組みを実装
 - SEO対応(robots.txt, 動的sitemap.xml, canonical, 薄いページのnoindex, JSON-LD)
 - トップページに「今週のイチオシ宿」セクションを追加
@@ -108,6 +109,19 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 - シンボリックリンクは使わない。borutomo側でCageFSサンドボックスがシンボリックリンクを
   辿れず403になった実績があるため、同じ物理コピー方式を踏襲している
 
+### ホテルのスクリーニングは last_selected_at で絞り込む(変えてはいけない設計)
+
+`discover_hotels.php`はエリアごとレビュー数上位12件だけを選び、選んだ行に
+`hotels.last_selected_at = NOW()`を書く。`fetch_prices.php`・`detect_deals.php`は
+**`last_selected_at`がこの2日以内(`SELECTION_FRESHNESS_DAYS`)のホテルだけ**を対象にする。
+選外になったホテルの行自体は削除しない(price_logs等の外部キー制約があり、
+過去の価格履歴も残しておきたいため)。
+
+**この列を見ずに`SELECT * FROM hotels`のような全件取得に戻すと、選外ホテルにも
+無限にAPIを叩き続ける不具合が再発する。** 2026-08-26に実際にこれで気づかないまま
+270件全部にAPIを叩いていた実績がある(discover_hotelsが108件に絞っても、
+fetch_pricesは絞り込みを見ていなかった)。
+
 ### ConoHa WINGアカウントの共有リスク(変えてはいけない設計)
 
 このアカウント(`c2870339`)は`borutomo.com`含む16ドメインと共有の共有ホスティング。
@@ -128,26 +142,13 @@ PHPプロセス枠はアカウント単位で共有されており、2026-08-24�
 
 ## 4. 現在直面している課題
 
-### 【未解決・要修正】discover_hotels.phpのホテル選別がfetch_prices.phpに効いていない
-
-`discover_hotels.php`はエリアごとレビュー数上位12件(`TOP_N_PER_AREA`)だけを
-upsertするが、`fetch_prices.php`は`hotels`テーブルの全件(`SELECT * FROM hotels`)を
-対象にしている。選ばれなかったホテルは削除されず(price_logs等の外部キー制約で
-単純DELETEもできない)テーブルに残り続けるため、**実際のAPI呼び出し数はスクリーニング前
-と変わっていない**(2026-08-26確認: discover後もhotelsは270件のまま、fetch_pricesも
-270件全部に価格ログを新規挿入していた)。スクリーニングでAPI予算を浮かせて更新頻度を
-上げる、という本来の狙いが達成できていない。
-
-対策案: `hotels`に`last_selected_at`のような列を足し、discover_hotels実行時に
-選ばれたホテルだけ更新、fetch_prices側は`last_selected_at`が直近のものだけに絞る
-(price_logs/baseline_prices/deals自体は削除せず、選外になったホテルの履歴は
-そのまま残す)。
-
 ### 楽天アプリapp1のブロック状況は要再確認
 
-app1(`3be1fc2f-...`)は2026-08-26中ブロックされたまま復旧しなかった。次回セッションで
-まず`rakuten_get_area_class()`をapp1単体で試すなどして復旧を確認し、2アプリ交互利用が
-実際に機能する状態に戻っているか確かめること。
+app1(`3be1fc2f-...`)は2026-08-26中ブロックされ、同日夜になっても復旧しなかった
+(discover_hotels.phpを再実行して確認済み)。次回セッションでまず
+`rakuten_get_area_class()`をapp1単体で試すなどして復旧を確認し、2アプリ交互利用が
+実際に機能する状態に戻っているか確かめること。復旧するまでは実質app2だけが
+9エリア中app2担当分(4エリア・48件)しかカバーできていない。
 
 ### Dealはまだ0件
 
@@ -161,12 +162,11 @@ Dealが0件のため未確認)。
 優先度順。
 
 1. **hotel-bargain-phpをgit管理下に置く。** 現状バージョン管理が無く、変更を追えない
-2. **discover_hotels.phpのホテル選別をfetch_prices.phpに反映させる**(4章の対策案を実装)。
-   これをやらないと2アプリ運用・レビュー数スクリーニングの効果が出ない
-3. app1の復旧確認と、2アプリ交互利用の本番動作再確認
-4. 数日後、実際にDealが検出されるか・LLM理由文が正しく入るかを確認
-5. Google Search Consoleへの登録・サイトマップ(`https://bargain.hotelx.tech/sitemap.xml`)送信
-6. 楽天デベロッパーズの各アプリのApplication URLを実際の本番ドメインに統一するか検討
+2. app1の復旧確認と、2アプリ交互利用の本番動作再確認(復旧したら残り5エリアも
+   discover_hotels.phpで拾えるか確認する)
+3. 数日後、実際にDealが検出されるか・LLM理由文が正しく入るかを確認
+4. Google Search Consoleへの登録・サイトマップ(`https://bargain.hotelx.tech/sitemap.xml`)送信
+5. 楽天デベロッパーズの各アプリのApplication URLを実際の本番ドメインに統一するか検討
    (app1は`https://hotel-bargain.com`名義のまま)
 
 ## 6. 作業の進め方(このプロジェクトでの約束)
