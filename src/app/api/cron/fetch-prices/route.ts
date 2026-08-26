@@ -13,7 +13,7 @@ function hasRoomInfo(entry: RakutenHotelEntry): entry is { roomInfo: RakutenRoom
   return "roomInfo" in entry;
 }
 
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 const LOOKAHEAD_DAYS = 14; // 「直前1〜2週間がメイン」の要件に合わせる
 const HOTEL_NO_BATCH_SIZE = 15; // VacantHotelSearch は hotelNo を最大15件まで一度に指定できる
@@ -25,16 +25,25 @@ function chunk<T>(items: T[], size: number): T[][] {
 }
 
 /**
- * 登録済みホテル（hotels テーブル）を対象に、直近1〜2週間分の空室・価格を
- * 楽天トラベル空室検索APIから取得し price_logs に積む。
+ * 登録済みホテル（hotels テーブル）を対象に、指定した1日分（デフォルトは
+ * チェックイン1日後）の空室・価格を楽天トラベル空室検索APIから取得し
+ * price_logs に積む。
  *
- * NOTE: 現時点ではエリア単位の巡回（largeClassCode等）はまだ実装しておらず、
- * hotels テーブルに事前登録されたホテルのみが対象。エリア横断の自動発見は
- * 楽天トラベル地区コードAPI(GetAreaClass)でエリアコードを揃えてからの次のステップ。
+ * NOTE: 当初は14日分をまとめて1リクエストで処理していたが、ホテル数が
+ * 増えると（270件 → 18バッチ×14日 = 252回のAPI呼び出し、レート制限順守の
+ * 1.1秒間隔だけで277秒）Vercelの関数実行時間上限を超えて実際にタイムアウト
+ * した。1リクエストにつき1日分だけを処理する形に分割し、日数分のループは
+ * 呼び出し側（GitHub Actions）に持たせることで、この関数自体は短時間で
+ * 確実に完了するようにしている。
+ *
+ * ?day=1〜14 でチェックインの何日後を処理するか指定する（省略時は1）。
  */
 export async function GET(request: NextRequest) {
   const unauthorized = assertCronRequest(request);
   if (unauthorized) return unauthorized;
+
+  const dayParam = Number(request.nextUrl.searchParams.get("day") ?? "1");
+  const dayOffset = Number.isInteger(dayParam) && dayParam >= 1 && dayParam <= LOOKAHEAD_DAYS ? dayParam : 1;
 
   const supabase = createServiceRoleSupabaseClient();
 
@@ -49,84 +58,80 @@ export async function GET(request: NextRequest) {
   }
 
   const hotelNoToId = new Map(hotels.map((h) => [h.rakuten_hotel_no, h.id]));
-  const checkinDates = Array.from({ length: LOOKAHEAD_DAYS }, (_, i) =>
-    format(addDays(new Date(), i + 1), "yyyy-MM-dd"),
-  );
+  const checkinDate = format(addDays(new Date(), dayOffset), "yyyy-MM-dd");
+  const checkoutDate = format(addDays(new Date(), dayOffset + 1), "yyyy-MM-dd");
 
   let insertedCount = 0;
   const errors: string[] = [];
 
   for (const batch of chunk(hotels.map((h) => h.rakuten_hotel_no), HOTEL_NO_BATCH_SIZE)) {
-    for (const checkinDate of checkinDates) {
-      const checkoutDate = format(addDays(new Date(checkinDate), 1), "yyyy-MM-dd");
-      try {
-        const res = await searchVacantHotels({
-          hotelNo: batch.join(","),
-          checkinDate,
-          checkoutDate,
-        });
+    try {
+      const res = await searchVacantHotels({
+        hotelNo: batch.join(","),
+        checkinDate,
+        checkoutDate,
+      });
 
-        const rows: {
-          hotel_id: number;
-          checkin_date: string;
-          checkout_date: string;
-          plan_name: string | null;
-          room_type: string | null;
-          price: number;
-        }[] = [];
+      const rows: {
+        hotel_id: number;
+        checkin_date: string;
+        checkout_date: string;
+        plan_name: string | null;
+        room_type: string | null;
+        price: number;
+      }[] = [];
 
-        // NOTE: res.hotels は「1ホテル分のエントリ配列」がそのまま要素になった配列の配列
-        // （{hotel: [...]} という包み方ではない。実レスポンスで確認済み）。
-        for (const hotelEntries of res.hotels) {
-          const basicInfoEntry = hotelEntries.find((entry) => "hotelBasicInfo" in entry);
-          if (!basicInfoEntry || !("hotelBasicInfo" in basicInfoEntry)) continue;
+      // NOTE: res.hotels は「1ホテル分のエントリ配列」がそのまま要素になった配列の配列
+      // （{hotel: [...]} という包み方ではない。実レスポンスで確認済み）。
+      for (const hotelEntries of res.hotels) {
+        const basicInfoEntry = hotelEntries.find((entry) => "hotelBasicInfo" in entry);
+        if (!basicInfoEntry || !("hotelBasicInfo" in basicInfoEntry)) continue;
 
-          const basicInfo = basicInfoEntry.hotelBasicInfo;
-          const hotelId = hotelNoToId.get(String(basicInfo.hotelNo));
-          if (!hotelId) continue;
+        const basicInfo = basicInfoEntry.hotelBasicInfo;
+        const hotelId = hotelNoToId.get(String(basicInfo.hotelNo));
+        if (!hotelId) continue;
 
-          // 画像・予約URL(affiliateId込み)・所在地はレスポンスのたびに最新化しておく。
-          // booking_url が無いと detect-deals で deal を起票できない（アフィリエイトURLを
-          // 推測で組み立てないため）。
-          // 緯度経度は楽天独自の秒単位形式なので rakutenCoordToDegrees で変換してから保存する。
-          await supabase
-            .from("hotels")
-            .update({
-              image_url: basicInfo.hotelImageUrl ?? basicInfo.hotelThumbnailUrl ?? null,
-              booking_url: basicInfo.hotelInformationUrl ?? null,
-              address: [basicInfo.address1, basicInfo.address2].filter(Boolean).join(""),
-              latitude: rakutenCoordToDegrees(basicInfo.latitude),
-              longitude: rakutenCoordToDegrees(basicInfo.longitude),
-            })
-            .eq("id", hotelId);
+        // 画像・予約URL(affiliateId込み)・所在地はレスポンスのたびに最新化しておく。
+        // booking_url が無いと detect-deals で deal を起票できない（アフィリエイトURLを
+        // 推測で組み立てないため）。
+        // 緯度経度は楽天独自の秒単位形式なので rakutenCoordToDegrees で変換してから保存する。
+        await supabase
+          .from("hotels")
+          .update({
+            image_url: basicInfo.hotelImageUrl ?? basicInfo.hotelThumbnailUrl ?? null,
+            booking_url: basicInfo.hotelInformationUrl ?? null,
+            address: [basicInfo.address1, basicInfo.address2].filter(Boolean).join(""),
+            latitude: rakutenCoordToDegrees(basicInfo.latitude),
+            longitude: rakutenCoordToDegrees(basicInfo.longitude),
+          })
+          .eq("id", hotelId);
 
-          for (const entry of hotelEntries.filter(hasRoomInfo)) {
-            for (const plan of normalizeRoomPrices(entry.roomInfo)) {
-              rows.push({
-                hotel_id: hotelId,
-                checkin_date: checkinDate,
-                checkout_date: checkoutDate,
-                plan_name: plan.planName,
-                room_type: plan.roomClass,
-                price: plan.totalPrice,
-              });
-            }
+        for (const entry of hotelEntries.filter(hasRoomInfo)) {
+          for (const plan of normalizeRoomPrices(entry.roomInfo)) {
+            rows.push({
+              hotel_id: hotelId,
+              checkin_date: checkinDate,
+              checkout_date: checkoutDate,
+              plan_name: plan.planName,
+              room_type: plan.roomClass,
+              price: plan.totalPrice,
+            });
           }
         }
-
-        if (rows.length > 0) {
-          const { error: insertError } = await supabase.from("price_logs").insert(rows);
-          if (insertError) throw insertError;
-          insertedCount += rows.length;
-        }
-      } catch (err) {
-        errors.push(`${checkinDate}: ${err instanceof Error ? err.message : String(err)}`);
       }
 
-      // 楽天側のレート制限（目安1QPS）を超えないよう間隔を空ける
-      await new Promise((resolve) => setTimeout(resolve, 1100));
+      if (rows.length > 0) {
+        const { error: insertError } = await supabase.from("price_logs").insert(rows);
+        if (insertError) throw insertError;
+        insertedCount += rows.length;
+      }
+    } catch (err) {
+      errors.push(`${checkinDate}: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    // 楽天側のレート制限（目安1QPS）を超えないよう間隔を空ける
+    await new Promise((resolve) => setTimeout(resolve, 1100));
   }
 
-  return NextResponse.json({ inserted: insertedCount, errors });
+  return NextResponse.json({ day: dayOffset, checkinDate, inserted: insertedCount, errors });
 }
