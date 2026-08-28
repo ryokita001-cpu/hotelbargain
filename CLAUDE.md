@@ -9,8 +9,9 @@
 役目を終えた。新しいセッションがこのディレクトリを開いた場合、まず
 `/Users/kitaryo/Projects/hotel-bargain-php` の状態を確認すること。
 
-**hotel-bargain-php は現時点でGit管理下に無い。** バージョン管理もデプロイ前後の
-差分確認もできない状態なので、早めにgit init & pushしておくことを推奨する。
+**hotel-bargain-php は GitHub の [ryokita001-cpu/hotel-bargain-php](https://github.com/ryokita001-cpu/hotel-bargain-php)（Private）でGit管理されている**（2026-08-29にgit init & 初回push済み）。
+`main`が本番相当。変更はfeatureブランチを切ってPR経由で`main`にマージする運用にした
+（詳細は6章）。
 
 ---
 
@@ -35,6 +36,10 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 - Gemini 2.5 Flash(無料枠)で「安さの推定理由」を生成する仕組みを実装
 - SEO対応(robots.txt, 動的sitemap.xml, canonical, 薄いページのnoindex, JSON-LD)
 - トップページに「今週のイチオシ宿」セクションを追加
+- hotel-bargain-phpをGitHub(Private)でGit管理下に置いた(3章参照)
+- GA4(測定ID `G-3MTPE9C50K`)のトラッキングタグを`index.php`/`deals.php`に設置。
+  トップページの検索フォーム送信時に`find_deals`カスタムイベント
+  (`area`/`checkin`/`min_discount`をパラメータ化)を発火する仕組みを追加、本番デプロイ済み
 
 ## 3. 技術構成・設計方針・重要なルール
 
@@ -46,6 +51,15 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 - ローカル開発: `config.php`（gitignore済み）にDB/API資格情報を書く。
   本番用は `deploy/config.production.php`（同じくgitignore済み）に書き、
   `bash deploy/conoha-sync.sh` でrsyncデプロイする
+
+### Git運用
+
+- リポジトリ: [ryokita001-cpu/hotel-bargain-php](https://github.com/ryokita001-cpu/hotel-bargain-php)(Private)
+- `config.php` / `deploy/config.production.php`は`.gitignore`済み(資格情報を含むため)
+- 変更は`main`に直接コミットせず、featureブランチ→PR→マージの流れで行う
+  (2026-08-29にGA4タグ導入をこの流れで実施)
+- git init時点のコード(GA4タグ導入前)がベースラインとして`main`の初回コミットに
+  なっている
 
 ### 楽天Web Service APIの実機検証済み仕様(ドキュメントに無い部分)
 
@@ -157,13 +171,21 @@ app1(`3be1fc2f-...`)は2026-08-26中ブロックされ、同日夜になって�
 (理由文生成自体はローカルで単体テスト済みだが、detect_deals.php経由での本番動作は
 Dealが0件のため未確認)。
 
+### GA4の`find_deals`イベントは受信未確認
+
+タグ設置・本番デプロイ・`window.gtag`が読み込まれていることまでは確認したが、
+GA4管理画面のリアルタイムレポートで実際にイベントが届くところまではまだ確認して
+いない。次回セッションでフォーム送信→リアルタイムレポート確認を行うこと。
+
 ## 5. 次に着手すべきタスク(Next Actions)
 
 優先度順。
 
-1. **hotel-bargain-phpをgit管理下に置く。** 現状バージョン管理が無く、変更を追えない
-2. app1の復旧確認と、2アプリ交互利用の本番動作再確認(復旧したら残り5エリアも
+1. app1の復旧確認と、2アプリ交互利用の本番動作再確認(復旧したら残り5エリアも
    discover_hotels.phpで拾えるか確認する)
+2. GA4のリアルタイムレポートで`find_deals`イベントの受信を確認。届いていたら
+   `area`/`checkin`/`min_discount`をカスタムディメンションとして登録し、必要なら
+   `find_deals`をコンバージョンとしてマークする
 3. 数日後、実際にDealが検出されるか・LLM理由文が正しく入るかを確認
 4. Google Search Consoleへの登録・サイトマップ(`https://bargain.hotelx.tech/sitemap.xml`)送信
 5. 楽天デベロッパーズの各アプリのApplication URLを実際の本番ドメインに統一するか検討
@@ -172,6 +194,7 @@ Dealが0件のため未確認)。
 ## 6. 作業の進め方(このプロジェクトでの約束)
 
 - 本番反映(`deploy/conoha-sync.sh`の実行)は必ず事前に確認を取る
+- GitHubへのpush・PR作成・マージも必ず事前に確認を取る
 - 「割引」「OFF」「セール」は使わない。「相場より○%安い」で統一する
 - `config.php` / `deploy/config.production.php`はGit管理外。値を一時的に書き換えて
   凌いだ場合は、作業完了後に必ず元の値へ戻す
