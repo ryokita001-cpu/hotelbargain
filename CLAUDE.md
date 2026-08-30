@@ -37,6 +37,11 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 - SEO対応(robots.txt, 動的sitemap.xml, canonical, 薄いページのnoindex, JSON-LD)
 - トップページに「今週のイチオシ宿」セクションを追加
 - hotel-bargain-phpをGitHub(Private)でGit管理下に置いた(3章参照)
+- 2026-08-30、サイト全体の監査を実施(hotel-bargain-php PR #29)。売り切れdealが
+  掲載され続ける不具合、GA4計測がonclickの構文エラーで欠測する不具合、カード画像が
+  原寸だった問題などを修正。宿ごとの価格推移ページ`/hotel/{hotelNo}/`を追加し、
+  インデックス対象を12URL→約280URLに拡張。ローカル検証環境(`tools/seed_local.php`,
+  `tools/router_local.php`, `tools/test_deal_lifecycle.php`)も整備した
 - GA4(測定ID `G-3MTPE9C50K`)のトラッキングタグを`index.php`/`deals.php`に設置。
   トップページの検索フォーム送信時に`find_deals`カスタムイベント
   (`area`/`checkin`/`min_discount`をパラメータ化)を発火する仕組みを追加、本番デプロイ済み
@@ -136,6 +141,33 @@ hotel-bargain.com は、楽天トラベルの空室検索APIをもとに「過�
 270件全部にAPIを叩いていた実績がある(discover_hotelsが108件に絞っても、
 fetch_pricesは絞り込みを見ていなかった)。
 
+### JSに値を埋めるときは js_value() を使う(変えてはいけない)
+
+`onclick="gtag(..., { name: '<?= htmlspecialchars($v, ENT_QUOTES) ?>' })"` は誤り。
+ブラウザは属性値のHTMLエンティティをJSパーサに渡す前に復号するため、`'` を含む値で
+構文エラーになりonclickが丸ごと実行されなくなる(2026-08-30まで実際に発生していた)。
+`lib/Site.php` の `js_value()`(json_encodeのHEXフラグ + htmlspecialchars)を使うこと。
+
+### 掲載できなくなったdealは必ず非活性化する(変えてはいけない)
+
+`detect_deals.php` のループ内で `continue` する場合、その前に必ず `$deactivate` を
+実行すること。価格が取れない(満室 or APIエラー)・baselineの根拠が足りない、いずれも
+「いま相場より安く泊まれる」と言えない状態なので掲載を続けてはいけない。
+`fetch_prices.php` はバッチ(15軒)単位で例外を握り潰すため、1回のAPIエラーで
+15軒分が同時にこの状態になる。回帰テストは `tools/test_deal_lifecycle.php`。
+
+### 一覧の画像は必ず200px版サムネイルを使う(変えてはいけない)
+
+`hotelImageUrl` の原寸は実測420KB/枚。カードを24枚並べると10MB近くになり、
+モバイルのLCP＝検索順位とCVRを直撃する。`rakuten_hotel_thumbnail_url()` を使い、
+必ず `onerror` で原寸にフォールバックさせること。
+
+### robots.txt で noindex ページをDisallowしない(変えてはいけない)
+
+`deals.php` の絞り込みURLは `noindex, follow` を出している。robots.txtで
+クロールを止めると、そのnoindexもcanonicalも読まれず、followによるエリアページへの
+リンク評価の流れも止まる。2026-08-30まで日付タブ(主要導線)全体をDisallowしていた。
+
 ### ConoHa WINGアカウントの共有リスク(変えてはいけない設計)
 
 このアカウント(`c2870339`)は`borutomo.com`含む16ドメインと共有の共有ホスティング。
@@ -156,40 +188,57 @@ PHPプロセス枠はアカウント単位で共有されており、2026-08-24�
 
 ## 4. 現在直面している課題
 
-### 楽天アプリapp1のブロック状況は要再確認
+### 【解決済み・要作業】app1がブロックされ続けていた原因が判明した
 
-app1(`3be1fc2f-...`)は2026-08-26中ブロックされ、同日夜になっても復旧しなかった
-(discover_hotels.phpを再実行して確認済み)。次回セッションでまず
-`rakuten_get_area_class()`をapp1単体で試すなどして復旧を確認し、2アプリ交互利用が
-実際に機能する状態に戻っているか確かめること。復旧するまでは実質app2だけが
-9エリア中app2担当分(4エリア・48件)しかカバーできていない。
+2026-08-30に判明。**このリポジトリ(Next.js版)のGitHub Actionsが、運用終了後も
+`state: active` のまま3時間おきに動き続けていた。**
 
-### Dealはまだ0件
+```
+最終実行: 2026-08-29T23:34Z  → {"deals":88,"errors":[]}
+```
 
-サンプル数が閾値(6)未満のため、まだ一件もDealが検出されていない(想定通りの挙動)。
-数日運用してから、実際にDealが出るか・LLMの理由文が正しく入るかを確認する必要がある
-(理由文生成自体はローカルで単体テスト済みだが、detect_deals.php経由での本番動作は
-Dealが0件のため未確認)。
+旧Vercelアプリ(`hotel-bargain.vercel.app`)は削除されておらず、Supabaseに書き込みを
+続けていた。`src/lib/rakuten/client.ts` のRefererは `https://hotel-bargain.com`＝
+**app1の登録済みApplication URL**。1回の実行で14日分ループするため、
+8回/日 × 14日 = 112リクエスト/日以上をapp1の枠から消費し続けていた。
 
-### GA4の`find_deals`イベントは受信未確認
+ワークフローの作成日時(2026-08-26 09:15 JST)は、app1がブロックされた日と一致する。
 
-タグ設置・本番デプロイ・`window.gtag`が読み込まれていることまでは確認したが、
-GA4管理画面のリアルタイムレポートで実際にイベントが届くところまではまだ確認して
-いない。次回セッションでフォーム送信→リアルタイムレポート確認を行うこと。
+対処はPR #2 でコミット済みだが、**スケジュール実行はデフォルトブランチから走るため、
+mainにマージするまで止まらない**。即座に止めるならGitHub UIの
+Actions → 「hotel-bargain cron」→ `...` → Disable workflow が最速。
+Vercelプロジェクトの削除は別途必要（リポジトリ外のため）。
+
+### Dealはまだ0件 → 検出されるようになった
+
+MIN_BASELINE_SAMPLESの単位を「行数」から「ユニークなチェックイン日数」に、
+baselineを曜日別7分類から平日/休前日の2分類に変えたことで、判定できる組み合わせが増えた。
+
+### GA4のイベント名がドキュメントとずれている
+
+このドキュメントには `find_deals` と書いてあったが、**コード上にそのイベントは存在しない**。
+現在発火しているのは `select_area` / `select_checkin` / `select_hotel` の3つ
+(`public/partials/area_map.php`, `week_tabs.php`, `hotel_card.php`, `hotel.php`)。
+
+なお `select_hotel` は、**宿名に `'` が含まれるとonclickが構文エラーになって
+発火しない**不具合が2026-08-30まであった(hotel-bargain-php PR #29 で修正)。
+それ以前の計測値は、該当する宿のぶんが欠測している前提で読むこと。
 
 ## 5. 次に着手すべきタスク(Next Actions)
 
-優先度順。
+優先度順。1〜3は人間にしかできない作業。
 
-1. app1の復旧確認と、2アプリ交互利用の本番動作再確認(復旧したら残り5エリアも
-   discover_hotels.phpで拾えるか確認する)
-2. GA4のリアルタイムレポートで`find_deals`イベントの受信を確認。届いていたら
-   `area`/`checkin`/`min_discount`をカスタムディメンションとして登録し、必要なら
-   `find_deals`をコンバージョンとしてマークする
-3. 数日後、実際にDealが検出されるか・LLM理由文が正しく入るかを確認
-4. Google Search Consoleへの登録・サイトマップ(`https://bargain.hotelx.tech/sitemap.xml`)送信
-5. 楽天デベロッパーズの各アプリのApplication URLを実際の本番ドメインに統一するか検討
-   (app1は`https://hotel-bargain.com`名義のまま)
+1. **旧Vercel環境を止める**（4章参照）。GitHub UIでワークフローをDisable →
+   Vercelプロジェクトを削除 or 環境変数を削除 → app1の復旧を確認
+2. **hotel-bargain-php PR #29 のマージとデプロイ**（`bash deploy/conoha-sync.sh`）。
+   スキーマ変更は無いのでマイグレーション不要
+3. デプロイ後、`~/hotel-bargain/logs/` に書き込み権限があることを確認
+   （ページキャッシュの置き場。無くてもキャッシュが効かないだけでページは出る）
+4. Google Search Consoleにサイトマップを再送信（宿ページが増えて12URL→約280URLになる）
+5. GA4で `select_hotel` / `select_checkin` / `select_area` の受信を確認し、
+   カスタムディメンションを登録。`select_hotel` をコンバージョンとしてマーク
+6. 楽天デベロッパーズの各アプリのApplication URLを本番ドメインに統一するか検討
+   （app1は`https://hotel-bargain.com`名義のまま。旧環境を消した後なら変更してよい）
 
 ## 6. 作業の進め方(このプロジェクトでの約束)
 
