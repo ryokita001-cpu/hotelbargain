@@ -38,6 +38,9 @@ Gemini API生成から移行、3章参照)。
 - レビュー数によるホテルの事前スクリーニング(`cron/discover_hotels.php`)を実装。
   `hotels.last_selected_at`で選外ホテルを絞り込む設計にした(3章参照)
 - SEO対応(robots.txt, 動的sitemap.xml, canonical, 薄いページのnoindex, JSON-LD)
+- トップページに「今週のイチオシ宿」セクションを追加(その後2026-09-04時点で
+  6件のカルーセル構成になっている。3章「安さの理由文はルールベースのテンプレート
+  選択」参照)
 - GA4(測定ID `G-3MTPE9C50K`)のトラッキングタグを`index.php`/`deals.php`に設置し、
   カスタムイベントを発火する仕組みを追加、本番デプロイ済み（イベント名は
   2026-08-30に用途別へ作り直した。受信確認は未実施、3章・4章参照）
@@ -98,6 +101,23 @@ Gemini API生成から移行、3章参照)。
     (`select_hotel`)を計測できるようにした
   - カード全体をクリックできるようにした(写真とホテル名が無反応だった)
   - トップとエリア一覧で同じホテルの別日が並ばないようにした
+- **2026-08-30、このリポジトリ(旧Next.js/Vercel版)がapp1ブロックの一因だったと
+  判明し、完全に停止させた**。移行後もGitHub Actionsのワークフローが3時間おきに
+  動き続け(最終実行2026-08-29T23:34Z、`{"deals":88,"errors":[]}`)、旧Vercelアプリ
+  (`hotel-bargain.vercel.app`)がSupabaseへの書き込みを継続していた。Refererが
+  `https://hotel-bargain.com`(当時のapp1登録Application URLと一致)だったため、
+  1回の実行で14日分ループする関係で1日あたり112リクエスト以上をapp1の枠から
+  消費し続けていた(ワークフロー作成日時2026-08-26 09:15 JSTがapp1ブロック開始日と
+  一致)。GitHub Actionsのワークフローを削除(リポジトリのワークフロー数0を確認)し、
+  Vercelプロジェクトも削除して停止させた
+- **2026-08-30、hotel-bargain-php側の監査(PR #29/#30/#31)で見つかった不具合を
+  まとめて修正した**: 売り切れdealが掲載され続ける不具合、`onclick`属性内のJS文字列が
+  ブラウザによるHTMLエンティティ復号でJS構文エラーになりGA4計測が欠測する不具合
+  (宿名に`'`を含む場合に発生。修正は`lib/Site.php`の`js_value()`、3章参照)、カード画像が
+  原寸(420KB/枚)のまま配信されていた問題を修正。宿ごとの価格推移ページ
+  `/hotel/{hotelNo}/`を新設し、サイトマップのインデックス対象を12URL→約280URLに
+  拡張。ローカル検証環境(`tools/seed_local.php`・`tools/router_local.php`・
+  `tools/test_deal_lifecycle.php`)も整備した
 - **2026-09-01、楽天アフィリエイトの収益導線を実機検証した**(詳細は3章
   「アフィリエイトURLは『その価格のプラン』に、iPhoneアプリでも日付付きで
   飛ばす」参照)。ユーザーが楽天アフィリエイト管理画面でクリックの発生
@@ -682,6 +702,33 @@ URL完全一致でキャッシュしており、`page_cache_key()`もクエリ�
 無限にAPIを叩き続ける不具合が再発する。** 2026-08-26に実際にこれで気づかないまま
 270件全部にAPIを叩いていた実績がある(discover_hotelsが108件に絞っても、
 fetch_pricesは絞り込みを見ていなかった)。
+
+### JSに値を埋めるときは js_value() を使う(変えてはいけない)
+
+`onclick="gtag(..., { name: '<?= htmlspecialchars($v, ENT_QUOTES) ?>' })"` は誤り。
+ブラウザは属性値のHTMLエンティティをJSパーサに渡す前に復号するため、`'` を含む値で
+構文エラーになりonclickが丸ごと実行されなくなる(2026-08-30まで実際に発生していた)。
+`lib/Site.php` の `js_value()`(json_encodeのHEXフラグ + htmlspecialchars)を使うこと。
+
+### 掲載できなくなったdealは必ず非活性化する(変えてはいけない)
+
+`detect_deals.php` のループ内で `continue` する場合、その前に必ず `$deactivate` を
+実行すること。価格が取れない(満室 or APIエラー)・baselineの根拠が足りない、いずれも
+「いま相場より安く泊まれる」と言えない状態なので掲載を続けてはいけない。
+`fetch_prices.php` はバッチ(15軒)単位で例外を握り潰すため、1回のAPIエラーで
+15軒分が同時にこの状態になる。回帰テストは `tools/test_deal_lifecycle.php`。
+
+### 一覧の画像は必ず200px版サムネイルを使う(変えてはいけない)
+
+`hotelImageUrl` の原寸は実測420KB/枚。カードを24枚並べると10MB近くになり、
+モバイルのLCP＝検索順位とCVRを直撃する。`rakuten_hotel_thumbnail_url()` を使い、
+必ず `onerror` で原寸にフォールバックさせること。
+
+### robots.txt で noindex ページをDisallowしない(変えてはいけない)
+
+`deals.php` の絞り込みURLは `noindex, follow` を出している。robots.txtで
+クロールを止めると、そのnoindexもcanonicalも読まれず、followによるエリアページへの
+リンク評価の流れも止まる。2026-08-30まで日付タブ(主要導線)全体をDisallowしていた。
 
 ### discover_hotels.phpのページング判定はpagingInfo配下を見ること(2026-09-06に発覚)
 
